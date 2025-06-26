@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  GIF Generator using Stability - Upload Image + Prompt - Generate Frames -  Make GIF
+
+Globals:
+  Function:
+    Timeout: 900
+    Runtime: python3.9
+    MemorySize: 1024
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        S3_BUCKET: !Ref ImageBucket
+        STABILITY_API_KEY: sk-api-key
+        NUM_FRAMES: 8
+        STRENGTH: 0.4
+        DURATION: 125
+        MODEL: sd3.5-medium
+        ACCESS_TOKEN: YOUR_ACCESS_TOKEN
+  Api:
+    Auth:
+      DefaultAuthorizer: NONE
+
+Resources:
+  ### S3 Bucket ###
+  ImageBucket:
+    Type: AWS::S3::Bucket
+
+  ### SQS Queue for Frame Generation ###
+  GenerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+
+  ### Upload API Function ###
+  UploadHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: upload_handler.lambda_handler
+      Events:
+        ApiUpload:
+          Type: Api
+          Properties:
+            Path: /generate
+            Method: post
+          Cors:
+            AllowMethods: "'POST,OPTIONS'"
+            AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            AllowOrigin: "'*'"
+        ApiUploadOptions:
+          Type: Api
+          Properties:
+            Path: /generate
+            Method: options
+          Cors:
+            AllowMethods: "'POST,OPTIONS'"
+            AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            AllowOrigin: "'http://localhost:8000'"
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref ImageBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt GenerationQueue.QueueName
+
+      Environment:
+        Variables:
+          GENERATION_QUEUE_URL: !Ref GenerationQueue
+
+  FrameGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FrameGeneratorSQSPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt GenerationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: arn:aws:events:us-east-1:ID:event-bus/default
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ### Frame Generator (Bedrock) Function ###
+  FrameGenerator:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: frame_generator.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - FrameGeneratorRole
+          - Arn
+      Events:
+        FrameQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt GenerationQueue.Arn
+
+  ### GIF Builder Function ###
+  GifBuilder:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: gif_builder.lambda_handler
+      Events:
+        GifEvent:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - gif.frames.complete
+              detail-type:
+                - GIFGeneration
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ImageBucket
+        - S3WritePolicy:
+            BucketName: !Ref ImageBucket
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint to POST image + prompt"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/generate"
